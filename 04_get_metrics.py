@@ -129,11 +129,12 @@ def parse_confidences_json(conf_path, pdb_path):
     with open(conf_path) as f:
         conf = json.load(f)
 
-    chains = get_chains_from_pdb(pdb_path)
     pae = np.array(conf["pae"])
     token_chain_ids, token_res_ids = extract_token_chain_and_res_ids(
         pdb_path
     )
+    # Derive chains from token-level data (consistent with what AF3 modeled)
+    chains = sorted(set(token_chain_ids))
 
     # Map chain IDs to their respective indices in the PAE matrix
     chain_indices = {chain: [] for chain in chains}
@@ -207,17 +208,36 @@ def parse_confidences_json(conf_path, pdb_path):
     return chain_pae, ipae, pae_interaction
 
 
+def sanitise_name(name):
+    """Reproduce AF3's name sanitisation (lowercase, replace non-alnum with _)."""
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in name).lower()
+
+
+def build_pdb_lookup(input_pdb_dir):
+    """Build a mapping from sanitised PDB basenames to actual PDB file paths."""
+    lookup = {}
+    for pdb_file in Path(input_pdb_dir).glob("*.pdb"):
+        key = sanitise_name(pdb_file.stem)
+        lookup[key] = pdb_file
+    return lookup
+
+
 def process_single_description(args):
     """
     Worker function to process all metrics for a single prediction directory.
     """
-    description, input_pdb_dir, base_dir = args
+    description, input_pdb_dir, base_dir, pdb_lookup = args
     try:
         # Construct directory and file paths
         base_path = Path(base_dir) / description / "seed-10_sample-0"
         summary_path = base_path / "summary_confidences.json"
         conf_path = base_path / "confidences.json"
-        pdb_path = Path(input_pdb_dir) / f"{description}.pdb"
+
+        # Look up the original PDB file using sanitised name mapping
+        pdb_path = pdb_lookup.get(description)
+        if pdb_path is None:
+            # Fallback: try direct match
+            pdb_path = Path(input_pdb_dir) / f"{description}.pdb"
 
         # Validate existence of required files
         if not summary_path.exists():
@@ -241,7 +261,10 @@ def process_single_description(args):
         # Load AlphaFold3 confidence data
         summary = json.loads(summary_path.read_text())
         conf = json.loads(conf_path.read_text())
-        chains = get_chains_from_pdb(pdb_path)
+        # Use chains from AF3 output (token_chain_ids) instead of the
+        # original PDB, since AF3 may tokenize fewer/more chains
+        # (e.g. ligand chains have different token counts).
+        chains = sorted(set(conf.get("token_chain_ids", [])))
 
         # Map chain-level ipTM and PTM scores
         iptm = dict(zip(chains, summary.get("chain_iptm", [])))
@@ -311,8 +334,8 @@ def extract_all_metrics_parallel(
     descriptions = [
         d for d in os.listdir(base_dir) if (Path(base_dir) / d).is_dir()
     ]
-    args_list = [(d, input_pdb_dir, base_dir) for d in descriptions]
-    pdb_paths = sorted(glob.glob(f"{input_pdb_dir}/*.pdb"))
+    pdb_lookup = build_pdb_lookup(input_pdb_dir)
+    args_list = [(d, input_pdb_dir, base_dir, pdb_lookup) for d in descriptions]
 
     results = []
     failed = []

@@ -109,10 +109,29 @@ def get_sequence_from_chain(chain):
     return sequence
 
 
+def is_ligand_chain(chain):
+    """Check if a chain is a ligand (no standard amino acid residues)."""
+    for residue in chain:
+        if residue.id[0] == " ":
+            resname = residue.get_resname().upper()
+            if resname in protein_letters_3to1:
+                return False
+    return True
+
+
+def count_ligand_atoms(chain):
+    """Count the number of atoms in a ligand chain (each atom = 1 AF3 token)."""
+    count = 0
+    for residue in chain:
+        for atom in residue:
+            count += 1
+    return count
+
+
 def process_single_pdb(args):
     """
     Process a single PDB file:
-    1. Extract sequences for each chain.
+    1. Extract sequences for each chain (protein or ligand).
     2. Save each chain as a separate .cif file for AlphaFold3 template compatibility.
     """
     input_pdb, output_dir_cif = args
@@ -122,43 +141,64 @@ def process_single_pdb(args):
         base_name = os.path.splitext(os.path.basename(input_pdb))[0]
 
         chain_sequences = {}
-        merged_sequence = ""
+        ligand_chains = {}
+        total_tokens = 0
 
         # Iterate through the first model (index 0) of the PDB
         for chain in structure[0]:
             chain_id = chain.id
-            sequence = get_sequence_from_chain(chain)
-            chain_sequences[chain_id] = sequence
-            merged_sequence += sequence
 
-            # Create a new structure object containing only this specific chain
-            new_structure = Structure.Structure("new_structure")
-            new_model = Model.Model(0)
-            new_structure.add(new_model)
-            new_model.add(chain.copy())
+            if is_ligand_chain(chain):
+                # Ligand chain: count atoms (1 atom = 1 token in AF3)
+                n_atoms = count_ligand_atoms(chain)
+                ligand_chains[chain_id] = n_atoms
+                total_tokens += n_atoms
+            else:
+                # Protein chain
+                sequence = get_sequence_from_chain(chain)
+                chain_sequences[chain_id] = sequence
+                total_tokens += len(sequence)
 
-            # Save as MMCIF format
-            cif_io = MMCIFIO()
-            cif_io.set_structure(new_structure)
-            cif_output = os.path.join(
-                output_dir_cif, f"{base_name}_chain_{chain_id}.cif"
-            )
-            cif_io.save(cif_output)
+                # Create a new structure object containing only this specific chain
+                new_structure = Structure.Structure("new_structure")
+                new_model = Model.Model(0)
+                new_structure.add(new_model)
+                new_model.add(chain.copy())
 
-        return base_name, chain_sequences, len(merged_sequence)
+                # Save as MMCIF format (only for protein chains used as templates)
+                cif_io = MMCIFIO()
+                cif_io.set_structure(new_structure)
+                cif_output = os.path.join(
+                    output_dir_cif, f"{base_name}_chain_{chain_id}.cif"
+                )
+                cif_io.save(cif_output)
+
+        return base_name, chain_sequences, total_tokens, ligand_chains
 
     except Exception as e:
         print(f"Error processing {input_pdb}: {str(e)}")
-        return None, None, None
+        return None, None, None, None
 
 
 def generate_json_files(tasks):
     """Generate AlphaFold3 formatted JSON input files from sequence data."""
-    row, cif_dir, output_dir = tasks
+    row, cif_dir, output_dir, smiles = tasks
     complex_name = row["complex"]
     chain_sequences = get_chain_sequences_from_row(row)
 
-    if not chain_sequences:
+    # Get ligand chain IDs from the row
+    ligand_chain_ids = []
+    ligand_cols = [
+        col
+        for col in row.index
+        if col.startswith("ligand_chain_")
+    ]
+    for col in ligand_cols:
+        if pd.notna(row[col]) and int(row[col]) > 0:
+            chain_id = col.split("_")[2]
+            ligand_chain_ids.append(chain_id)
+
+    if not chain_sequences and not ligand_chain_ids:
         print(f"⚠️ Warning: No valid chain sequences for {complex_name}")
         return None
 
@@ -187,6 +227,22 @@ def generate_json_files(tasks):
                             "templateIndices": list(range(len(sequence))),
                         }
                     ],
+                }
+            }
+        )
+
+    # Add ligand chains with SMILES
+    for chain_id in ligand_chain_ids:
+        if not smiles:
+            print(
+                f"⚠️ Warning: Ligand chain {chain_id} found but no --smiles provided, skipping"
+            )
+            continue
+        sequences.append(
+            {
+                "ligand": {
+                    "id": chain_id,
+                    "smiles": smiles,
                 }
             }
         )
@@ -234,6 +290,12 @@ def get_seq_main():
         default=None,
         help="Number of batch groups to create",
     )
+    parser.add_argument(
+        "--smiles",
+        type=str,
+        default="",
+        help="SMILES string for ligand chains",
+    )
     args = parser.parse_args()
 
     # Environment Setup
@@ -263,34 +325,38 @@ def get_seq_main():
         )
 
     # Consolidate results into sequence metadata
-    for base_name, chain_sequences, length in results:
+    for base_name, chain_sequences, total_tokens, ligand_chains in results:
         if base_name is not None:
             sequences_dict[base_name] = {
                 "sequences": chain_sequences,
-                "length": length,
+                "length": total_tokens,
+                "ligand_chains": ligand_chains,
             }
 
-    # Aggregate all unique chain IDs across all structures for CSV alignment
-    all_chain_ids = set()
+    # Aggregate all unique protein chain IDs and ligand chain IDs
+    all_protein_chain_ids = set()
+    all_ligand_chain_ids = set()
     for entry in sequences_dict.values():
-        all_chain_ids.update(entry["sequences"].keys())
+        all_protein_chain_ids.update(entry["sequences"].keys())
+        all_ligand_chain_ids.update(entry["ligand_chains"].keys())
 
-    def chain_sort_key(chain_id):
-        return str(chain_id)
-
-    all_chain_ids = sorted(list(all_chain_ids), key=chain_sort_key)
+    all_protein_chain_ids = sorted(all_protein_chain_ids, key=str)
+    all_ligand_chain_ids = sorted(all_ligand_chain_ids, key=str)
 
     # Prepare DataFrame rows
     rows = []
     for complex_name, entry in sequences_dict.items():
         chain_data = entry["sequences"]
+        ligand_data = entry["ligand_chains"]
         row = {"complex": complex_name, "total_length": entry["length"]}
-        for chain_id in all_chain_ids:
+        for chain_id in all_protein_chain_ids:
             row[f"chain_{chain_id}_seq"] = chain_data.get(chain_id, "")
+        for chain_id in all_ligand_chain_ids:
+            row[f"ligand_chain_{chain_id}"] = ligand_data.get(chain_id, 0)
         rows.append(row)
 
     df = pd.DataFrame(rows)
-    # Reorder columns: ID, Length, then specific chain sequences
+    # Reorder columns: ID, Length, then specific chain sequences, then ligand info
     cols = ["complex", "total_length"] + [
         c for c in df.columns if c not in ["complex", "total_length"]
     ]
@@ -300,7 +366,7 @@ def get_seq_main():
 
     # Phase 2: Parallel JSON Generation
     json_tasks = [
-        (r, args.output_dir_cif, args.output_dir_json)
+        (r, args.output_dir_cif, args.output_dir_json, args.smiles)
         for _, r in df.iterrows()
     ]
     with mp.Pool(processes=num_workers) as pool:
@@ -350,7 +416,7 @@ def get_seq_main():
                 (".pdb", args.input_dir, bd_pdb),
                 (".json", args.output_dir_json, bd_json),
             ]:
-                src = os.path.join(src_dir, f"{cid}{ext}")
+                src = os.path.abspath(os.path.join(src_dir, f"{cid}{ext}"))
                 if os.path.exists(src):
                     dest_path = os.path.join(
                         dest_dir, os.path.basename(src)

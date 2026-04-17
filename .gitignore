@@ -2,3 +2,10 @@
 __pycache__/
 *.pyc
 *.pyo
+
+*_af3score/
+input/
+
+# Generated CCD artifacts (rebuild from RCSB components.cif.gz — see CHANGES_LIG.md)
+src/alphafold3/constants/converters/ccd.pickle
+src/alphafold3/constants/converters/chemical_component_sets.pickle

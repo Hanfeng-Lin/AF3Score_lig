@@ -127,12 +127,22 @@ def get_atom_coords(residue: PDB.Residue, atom_name: str) -> np.ndarray:
     return np.zeros(3)
 
 
+def is_ligand_chain(chain) -> bool:
+    """Check if a chain is a ligand (no standard amino acid residues)."""
+    for res in chain:
+        if PDB.is_aa(res):
+            return False
+    return True
+
+
 def structure_to_array(
-    structure: Structure, chain_ids: List[str] = None
+    structure: Structure, chain_ids: List[str] = None,
+    include_ligands: bool = False,
 ) -> np.ndarray:
     """
     Converts structure to a coordinate array.
-    Each residue is mapped to a 24-atom slot (padded with zeros) based on ATOM14 order.
+    Protein residues: mapped to 24-atom slots based on ATOM14 order.
+    Ligand atoms (when include_ligands=True): 1 token per atom, coord in slot 0.
     """
     model = structure[0]
     all_coords_list = []
@@ -149,32 +159,41 @@ def structure_to_array(
         chain = model[chain_id]
         chain_coords_list = []
 
-        for res in chain:
-            if not PDB.is_aa(res):
-                continue
+        if include_ligands and is_ligand_chain(chain):
+            # Ligand chain: 1 atom = 1 token, coordinate in slot 0
+            for res in chain:
+                for atom in res:
+                    atom_coords_24 = np.zeros((24, 3))
+                    atom_coords_24[0] = atom.get_coord()
+                    chain_coords_list.append(atom_coords_24)
+        else:
+            # Protein chain: standard ATOM14 mapping
+            for res in chain:
+                if not PDB.is_aa(res):
+                    continue
 
-            resname = res.get_resname()
-            if resname not in ATOM14:
-                print(
-                    f"Warning: Residue {resname} not recognized. Skipping."
-                )
-                continue
+                resname = res.get_resname()
+                if resname not in ATOM14:
+                    print(
+                        f"Warning: Residue {resname} not recognized. Skipping."
+                    )
+                    continue
 
-            # Initialize fixed-size array (24 atoms max per residue)
-            res_coords_24 = np.zeros((24, 3))
-            atom_order = ATOM14[resname]
+                # Initialize fixed-size array (24 atoms max per residue)
+                res_coords_24 = np.zeros((24, 3))
+                atom_order = ATOM14[resname]
 
-            atom_index = 0
-            for atom_name in atom_order:
-                if atom_name in res:
-                    coord = res[atom_name].get_coord()
-                    if atom_index < 24:
-                        res_coords_24[atom_index] = coord
-                        atom_index += 1
-                    else:
-                        break
+                atom_index = 0
+                for atom_name in atom_order:
+                    if atom_name in res:
+                        coord = res[atom_name].get_coord()
+                        if atom_index < 24:
+                            res_coords_24[atom_index] = coord
+                            atom_index += 1
+                        else:
+                            break
 
-            chain_coords_list.append(res_coords_24)
+                chain_coords_list.append(res_coords_24)
 
         if chain_coords_list:
             chain_coords = np.stack(chain_coords_list, axis=0)
@@ -183,15 +202,19 @@ def structure_to_array(
     if not all_coords_list:
         raise ValueError("No valid coordinates found in any chain")
 
-    # Concatenate all chains into a single array: [Total_Residues, 24, 3]
+    # Concatenate all chains into a single array: [Total_Tokens, 24, 3]
     coords = np.concatenate(all_coords_list, axis=0)
     return coords
 
 
 def get_sequence_length(
-    structure: Structure, chain_ids: List[str] = None
+    structure: Structure, chain_ids: List[str] = None,
+    include_ligands: bool = False,
 ) -> int:
-    """Calculates the total amino acid sequence length across specified chains."""
+    """Calculates the total token count across specified chains.
+    Protein residues count as 1 token each.
+    Ligand atoms count as 1 token each (when include_ligands=True).
+    """
     model = structure[0]
     total_length = 0
     if chain_ids is None:
@@ -201,7 +224,12 @@ def get_sequence_length(
             print(f"Warning: Chain {chain_id} not found in structure")
             continue
         chain = model[chain_id]
-        total_length += len([res for res in chain if PDB.is_aa(res)])
+        if include_ligands and is_ligand_chain(chain):
+            # Each ligand atom = 1 token
+            for res in chain:
+                total_length += len(list(res.get_atoms()))
+        else:
+            total_length += len([res for res in chain if PDB.is_aa(res)])
     return total_length
 
 
@@ -272,6 +300,7 @@ def pdb_to_traced_array(
     num_copies: int = 5,
     save_path: str = None,
     max_length: int = 3072,
+    include_ligands: bool = False,
 ) -> Tuple[jnp.ndarray, int]:
     """Processes a PDB file: parses, pads to bucket size, repeats, and converts to JAX."""
     structure = load_structure(pdb_path)
@@ -279,7 +308,8 @@ def pdb_to_traced_array(
     if chain_ids is None:
         chain_ids = [chain.id for chain in structure[0]]
 
-    seq_length = get_sequence_length(structure, chain_ids)
+    seq_length = get_sequence_length(structure, chain_ids,
+                                     include_ligands=include_ligands)
 
     # Validate against max bucket size
     if seq_length > BUCKETS[-1]:
@@ -289,7 +319,8 @@ def pdb_to_traced_array(
         return None, seq_length
 
     target_length = find_bucket_size(seq_length, BUCKETS)
-    coords = structure_to_array(structure, chain_ids)
+    coords = structure_to_array(structure, chain_ids,
+                                include_ligands=include_ligands)
 
     # Pad with zeros to meet bucket size
     if seq_length < target_length:
@@ -321,7 +352,7 @@ def pdb_to_traced_array(
 
 def process_single_file(args):
     """Wrapper function for processing a single file, used by multiprocessing."""
-    input_path, output_path, chain_ids, num_copies = args
+    input_path, output_path, chain_ids, num_copies, include_ligands = args
     try:
         result = pdb_to_traced_array(
             pdb_path=input_path,
@@ -329,6 +360,7 @@ def process_single_file(args):
             num_copies=num_copies,
             save_path=output_path,
             max_length=3072,
+            include_ligands=include_ligands,
         )
         if result[0] is None:
             return (False, input_path)
@@ -344,6 +376,7 @@ def process_pdb_folder(
     chain_ids: List[str] = None,
     num_copies: int = 5,
     num_workers: int = None,
+    include_ligands: bool = False,
 ) -> None:
     """Parallel processing of a directory containing PDB files."""
     os.makedirs(output_folder, exist_ok=True)
@@ -357,7 +390,8 @@ def process_pdb_folder(
                 output_folder, f"{os.path.splitext(filename)[0]}.h5"
             )
             processing_args.append(
-                (input_path, output_path, chain_ids, num_copies)
+                (input_path, output_path, chain_ids, num_copies,
+                 include_ligands)
             )
 
     if not processing_args:
@@ -395,7 +429,8 @@ def process_pdb_folder(
                 output_folder, f"{os.path.splitext(filename)[0]}.h5"
             )
             retry_args.append(
-                (failed_file, output_path, chain_ids, num_copies)
+                (failed_file, output_path, chain_ids, num_copies,
+                 include_ligands)
             )
 
         with mp.Pool(processes=num_workers) as pool:
@@ -439,8 +474,15 @@ def main():
         default=4,
         help="Number of parallel processes (default: 4)",
     )
+    parser.add_argument(
+        "--smiles",
+        type=str,
+        default="",
+        help="SMILES string for ligand chains (enables ligand token support)",
+    )
     args = parser.parse_args()
 
+    include_ligands = bool(args.smiles)
     pdb_folder = args.pdb_folder
     # Extract bucket size from the folder name suffix (e.g., folder_name_512)
     try:
@@ -465,6 +507,7 @@ def main():
         chain_ids=None,
         num_copies=1,
         num_workers=num_workers,
+        include_ligands=include_ligands,
     )
 
 
